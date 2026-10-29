@@ -791,9 +791,11 @@ fn archive(ctx: &Ctx, fmt: &'static str) {
                 if tools::run(c).is_err() {
                     let _ = std::fs::remove_file(&out);
                     // fallback for unusual file names
-                    let list = items.iter().map(|p| p.to_string_lossy().replace('\'', "''")).map(|p| format!("'{p}'")).collect::<Vec<_>>().join(",");
-                    let script = format!("Compress-Archive -LiteralPath {list} -DestinationPath $args[0] -CompressionLevel Optimal");
-                    tools::powershell(&script, &[out.as_os_str()])?;
+                    // paths go in as separate arguments, never into the script text
+                    let script = "param([string]$dest)\nCompress-Archive -LiteralPath $args -DestinationPath $dest -CompressionLevel Optimal";
+                    let mut args = vec![out.as_os_str()];
+                    args.extend(items.iter().map(|p| p.as_os_str()));
+                    tools::powershell(script, &args)?;
                 }
             }
         }

@@ -39,15 +39,26 @@ enum Btn {
     Internet,
 }
 
+/// Largest single upload accepted from a phone.
+const MAX_UPLOAD: u64 = 8 * 1024 * 1024 * 1024;
+/// Wrong-link requests allowed per device before it is blocked for this share.
+const MAX_BAD_REQUESTS: u32 = 20;
+
 struct ServerState {
     stop: AtomicBool,
     downloads: AtomicU32,
     tunnel: std::sync::Mutex<Option<std::process::Child>>,
+    bad: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl ServerState {
     fn new() -> Arc<Self> {
-        Arc::new(ServerState { stop: AtomicBool::new(false), downloads: AtomicU32::new(0), tunnel: std::sync::Mutex::new(None) })
+        Arc::new(ServerState {
+            stop: AtomicBool::new(false),
+            downloads: AtomicU32::new(0),
+            tunnel: std::sync::Mutex::new(None),
+            bad: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     fn shutdown(&self) {
@@ -318,11 +329,25 @@ fn local_ip() -> Option<String> {
     (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
 }
 
+/// 128-bit link secret from the OS cryptographic RNG.
 fn token() -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(format!("{:?}{}{:p}", std::time::SystemTime::now(), std::process::id(), &h as *const _).as_bytes());
-    h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect()
+    use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    let mut buf = [0u8; 16];
+    let ok = unsafe { BCryptGenRandom(None, &mut buf, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.is_ok();
+    assert!(ok, "system RNG unavailable");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The device behind a request; through the internet tunnel everything arrives from
+/// localhost, so use the address Cloudflare reports instead.
+fn client_of(req: &tiny_http::Request) -> String {
+    let remote = req.remote_addr().map(|a| a.ip());
+    if remote.is_some_and(|ip| ip.is_loopback()) {
+        if let Some(h) = req.headers().iter().find(|h| h.field.equiv("Cf-Connecting-Ip")) {
+            return h.value.as_str().to_string();
+        }
+    }
+    remote.map(|ip| ip.to_string()).unwrap_or_default()
 }
 
 fn start_server(state: Arc<ServerState>, mode: Mode, files: Vec<FileEntry>, folder: Option<PathBuf>) -> Result<String, String> {
@@ -385,16 +410,56 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+/// Invisible / direction-changing characters that can disguise a file name
+/// (e.g. "photo{U+202E}gpj.exe" displaying as "photoexe.jpg").
+fn is_format_char(c: char) -> bool {
+    matches!(c as u32, 0x00AD | 0x061C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
+}
+
 fn sanitize(name: &str) -> String {
-    let n: String = name.chars().map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect();
-    let n = n.trim().trim_start_matches('.').to_string();
-    if n.is_empty() { "file".into() } else { n }
+    let n: String = name
+        .chars()
+        .filter(|c| !is_format_char(*c))
+        .map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c })
+        .collect();
+    let n = n.trim().trim_start_matches('.').trim_end_matches(['.', ' ']).to_string();
+    let n: String = n.chars().take(180).collect();
+    // Windows reserved device names (CON, NUL, COM1…) can't be normal files
+    let stem = n.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit());
+    if n.is_empty() {
+        "file".into()
+    } else if reserved {
+        format!("_{n}")
+    } else {
+        n
+    }
+}
+
+/// Mark a received file as coming from another device ("Mark of the Web"), so
+/// Windows SmartScreen / Office warn before running or opening it.
+fn mark_of_the_web(path: &Path) {
+    let mut ads = path.as_os_str().to_owned();
+    ads.push(":Zone.Identifier");
+    let _ = std::fs::write(ads, "[ZoneTransfer]\r\nZoneId=3\r\n");
 }
 
 fn handle(req: tiny_http::Request, tok: &str, mode: Mode, files: &[FileEntry], folder: Option<&Path>, state: &ServerState) {
     let url = req.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
     let base = format!("/{tok}");
+    let client = client_of(&req);
+    // anyone guessing links gets cut off after a few misses
+    if state.bad.lock().unwrap().get(&client).copied().unwrap_or(0) >= MAX_BAD_REQUESTS {
+        let _ = req.respond(tiny_http::Response::from_string("Too many requests").with_status_code(429));
+        return;
+    }
+    if path != base && !path.starts_with(&format!("{base}/")) {
+        *state.bad.lock().unwrap().entry(client).or_insert(0) += 1;
+        let _ = req.respond(tiny_http::Response::from_string("Not found").with_status_code(404));
+        return;
+    }
     let html = |body: String| tiny_http::Response::from_string(body).with_header(header("Content-Type", "text/html; charset=utf-8")).with_header(header("Cache-Control", "no-store"));
     if path == base || path == format!("{base}/") {
         let page = match mode {
@@ -426,8 +491,14 @@ fn handle(req: tiny_http::Request, tok: &str, mode: Mode, files: &[FileEntry], f
             let name = query.split('&').find_map(|kv| kv.strip_prefix("name=")).map(pct_decode).unwrap_or_else(|| "file".into());
             let target = util::unique(folder.join(sanitize(&name)));
             let mut req = req;
-            let ok = std::fs::File::create(&target).and_then(|mut f| std::io::copy(&mut req.as_reader().take(u64::MAX), &mut f)).is_ok();
+            if req.body_length().is_some_and(|n| n as u64 > MAX_UPLOAD) {
+                let _ = req.respond(tiny_http::Response::from_string("File too large").with_status_code(413));
+                return;
+            }
+            let written = std::fs::File::create(&target).and_then(|mut f| std::io::copy(&mut req.as_reader().take(MAX_UPLOAD + 1), &mut f));
+            let ok = matches!(written, Ok(n) if n <= MAX_UPLOAD);
             if ok {
+                mark_of_the_web(&target);
                 let n = state.downloads.fetch_add(1, Ordering::Relaxed) + 1;
                 let nm = util::name(&target);
                 post_ui(move || {
